@@ -84,6 +84,7 @@ def process(args, config, model: torch.nn.Module):
             n_steps=n_step, 
             cfg=cfg,
             use_fp16=args.use_fp16,
+            max_seg_sec=getattr(args, "max_seg_sec", 30.0),
         )
     generated_audio = generated_audio.squeeze().float().cpu().numpy()
     if args.pitch_shift != generated_shift:
@@ -117,6 +118,10 @@ if __name__ == "__main__":
     parser.add_argument("--pitch_shift", type=int, default=0)
     parser.add_argument("--n_steps", type=int, default=32)
     parser.add_argument("--cfg", type=float, default=3.0)
+    # 上游硬编码 30s/段（soulxsinger_svc.py:257），+num_overlaps 余量实测可达 33s，
+    # 6GB 卡上最长段会爆显存换页（song_2 卡在 8/10 段 12 分钟无进展）
+    parser.add_argument("--max_seg_sec", type=float, default=30.0,
+                        help="SVC 单段最长秒数（6GB 显存建议 20）")
     parser.add_argument(
         "--fp16",
         action="store_true",

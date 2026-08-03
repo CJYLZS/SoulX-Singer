@@ -134,8 +134,10 @@ class SoulXSingerSVC(nn.Module):
                     idx += 1
                 run_end = idx
                 if (run_end - run_start) >= uv_frames_th:
-                    split_point = max(run_end - 5, (run_start + run_end) // 2)
-                    append_split_point(split_point)
+                    # 静音 run 起点和终点各打一个切分点，把静音段独立出来，
+                    # 否则切中点会让尾奏/间奏的无人声被夹进相邻段一起推理
+                    append_split_point(run_start)
+                    append_split_point(run_end)
             else:
                 idx += 1
         append_split_point(total_frames)
@@ -144,40 +146,62 @@ class SoulXSingerSVC(nn.Module):
         segments: List[Tuple[int, int]] = []
         overlap_segments: List[Tuple[int, int]] = []
 
+        def active(gi: int) -> bool:
+            """split_points 的第 gi 格（格 = 相邻两个切分点之间）是否有人声。"""
+            start_f = split_points[gi]
+            end_f = split_points[gi + 1]
+            total = end_f - start_f
+            if total <= 0:
+                return False
+            v = int(np.sum(f0_np[start_f:end_f] > 0))
+            return v / total > 0.05 and v >= 10
+
         def append_segment(start_idx: int, end_idx: int, num_overlaps: int = num_overlaps):
             segments.append((split_points[start_idx] / f0_rate, split_points[end_idx] / f0_rate))
+            # overlap 起点：往前找相邻的活性格（不跨静音格），供 infer_segment 带前置上下文
             overlap_start_idx = start_idx
-            if start_idx > 0 and (split_points[end_idx] - split_points[start_idx - num_overlaps]) <= max_frames:
-                overlap_start_idx = start_idx - num_overlaps
+            k = start_idx - 1
+            cnt = 0
+            while k >= 0 and cnt < num_overlaps and active(k):
+                if split_points[end_idx] - split_points[k] > max_frames:
+                    break
+                overlap_start_idx = k
+                cnt += 1
+                k -= 1
             overlap_segments.append((split_points[overlap_start_idx] / f0_rate, split_points[end_idx] / f0_rate))
 
-        segment_start, segment_end = 0, 1
-        
-        while segment_start < len(split_points) - 1:
-            while segment_end < len(split_points) and (split_points[segment_end] - split_points[segment_start]) < min_frames:
-                segment_end += 1
+        # 活性优先合并：静音格（run_start/run_end 已独立切分）不进段，直接跳过；
+        # 相邻活性格可跨短静音格（< min_frames）合并，但不得吞入长静音格。
+        # 短活性段不再被 min_frames 强制拼长——宁可独立推理，也不带尾部静音。
+        i = 0
+        n_grids = len(split_points) - 1
+        while i < n_grids:
+            if not active(i):
+                i += 1
+                continue
+            j = i
+            while j + 1 < n_grids:
+                if split_points[j + 2] - split_points[i] > max_frames:
+                    break
+                if active(j + 1) or (split_points[j + 2] - split_points[j + 1]) < min_frames:
+                    j += 1
+                else:
+                    break
+            append_segment(i, j + 1)
+            i = j + 1
 
-            if segment_end >= len(split_points):
-                append_segment(segment_start, len(split_points) - 1, num_overlaps=num_overlaps)
-                break
-            append_segment(segment_start, segment_end, num_overlaps=num_overlaps)
-            segment_start = segment_end
-            segment_end = segment_start + 1
-
-        # print(f"Final segments (overlap_start, overlap_end, seg_start_time, seg_end_time) in seconds: {overlap_segments}")
+        # 兜底：静音格可能携带噪声帧导致 active 误判，这里按整段活性再滤一遍
         if ignore_silent_segments:
             filtered_idx = []
-            for i, seg in enumerate(overlap_segments):
+            for i, seg in enumerate(segments):
                 start_frame = int(seg[0] * f0_rate)
                 end_frame = int(seg[1] * f0_rate)
                 total_frames = end_frame - start_frame
                 voice_frames = np.sum(f0_np[start_frame:end_frame] > 0)
-                if voice_frames / total_frames > 0.05 and voice_frames >= 10:   # at least 10 voiced frames and >5% voiced frames
+                if voice_frames / total_frames > 0.05 and voice_frames >= 10:
                     filtered_idx.append(i)
-
             overlap_segments = [overlap_segments[i] for i in filtered_idx]
             segments = [segments[i] for i in filtered_idx]
-            # print(f"Filtered segments with mostly silence removed: {overlap_segments}")
 
         return overlap_segments, segments
     
@@ -192,6 +216,7 @@ class SoulXSingerSVC(nn.Module):
         n_steps=32,
         cfg=3,
         use_fp16=False,
+        max_seg_sec=30.0,
     ):
         """
         SVC inference pipeline. First build vocal segments based on F0 contour, then run inference for each segment and merge results.
@@ -230,7 +255,7 @@ class SoulXSingerSVC(nn.Module):
             gt_f0 = gt_f0.half()
 
         # if target audio is less than 30 seconds, infer the whole audio
-        if gt_wav.shape[-1] < 30 * self.audio_cfg.sample_rate:
+        if gt_wav.shape[-1] < max_seg_sec * self.audio_cfg.sample_rate:
             with _autocast_if(use_fp16):
                 generated_audio = self.infer_segment(
                     pt_mel=pt_mel,
@@ -253,8 +278,8 @@ class SoulXSingerSVC(nn.Module):
             gt_f0,
             f0_rate=f0_rate,
             uv_frames_th=10,
-            min_duration_sec=15.0,
-            max_duration_sec=30.0,
+            min_duration_sec=min(15.0, max_seg_sec / 2),
+            max_duration_sec=max_seg_sec,
         )
         if len(segments) == 0:
             segments = [(0.0, gt_wav.shape[-1] / self.audio_cfg.sample_rate)]
