@@ -95,6 +95,9 @@ def process(args, config, model: torch.nn.Module):
             cfg=cfg,
             use_fp16=args.use_fp16,
             max_seg_sec=getattr(args, "max_seg_sec", 30.0),
+            seed=getattr(args, "seed", None),
+            num_overlaps=getattr(args, "num_overlaps", 1),
+            rescale_cfg=getattr(args, "rescale_cfg", 0.75),
         )
     generated_audio = generated_audio.squeeze().float().cpu().numpy()
     if args.pitch_shift != generated_shift:
@@ -131,10 +134,17 @@ if __name__ == "__main__":
                         help='移调半音数，或 "auto" 按段对齐到最近八度')
     parser.add_argument("--n_steps", type=int, default=32)
     parser.add_argument("--cfg", type=float, default=3.0)
+    parser.add_argument("--rescale_cfg", type=float, default=0.75,
+                        help="CFG 外推结果的 std 归一化混合比（1=全归一化，0=用原始外推；上游 0.75）")
     # 上游硬编码 30s/段（soulxsinger_svc.py:257），+num_overlaps 余量实测可达 33s，
     # 6GB 卡上最长段会爆显存换页（song_2 卡在 8/10 段 12 分钟无进展）
     parser.add_argument("--max_seg_sec", type=float, default=30.0,
                         help="SVC 单段最长秒数（6GB 显存建议 20）")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="CFM 初始噪声 seed（None = 每次随机，设定后可复现；"
+                             "方差实验/多采样选优时使用）")
+    parser.add_argument("--num_overlaps", type=int, default=1,
+                        help="每段往前取几个活性格作为上下文（默认 1；总窗仍受 max_seg_sec 限制）")
     parser.add_argument(
         "--fp16",
         action="store_true",

@@ -172,11 +172,22 @@ class SoulXSingerSVC(nn.Module):
 
         def append_segment(start_idx: int, end_idx: int, num_overlaps: int = num_overlaps):
             segments.append((split_points[start_idx] / f0_rate, split_points[end_idx] / f0_rate))
-            # overlap 起点：往前找相邻的活性格（不跨静音格），供 infer_segment 带前置上下文
+            # overlap 起点：往前找活性格，供 infer_segment 带前置上下文（模型靠它建立音色）。
+            # 本地补丁：silence-aware 分段把静音 run 独立成格之后，start_idx-1 必然是静音格，
+            # 原来的 `while ... and active(k)` 第一轮就失败 —— 实测 song_2 6/6、song_9 12/12
+            # 段的上下文都是 0.00s，num_overlaps 完全是废参。现在允许跨过短静音格
+            # （< min_frames，与前向合并同一判据）去够前面的活性格；长静音（间奏/尾奏）
+            # 仍是硬边界。注意总长仍受 max_frames 约束（whisper 30s 硬顶），所以
+            # max_seg_sec 越接近 30，可用的上下文空间越小。
             overlap_start_idx = start_idx
             k = start_idx - 1
             cnt = 0
-            while k >= 0 and cnt < num_overlaps and active(k):
+            while k >= 0 and cnt < num_overlaps:
+                if not active(k):
+                    if (split_points[k + 1] - split_points[k]) < min_frames:
+                        k -= 1      # 短静音格：跳过继续往前找
+                        continue
+                    break           # 长静音格：硬边界
                 if split_points[end_idx] - split_points[k] > max_frames:
                     break
                 overlap_start_idx = k
@@ -229,8 +240,11 @@ class SoulXSingerSVC(nn.Module):
         pitch_shift=0,
         n_steps=32,
         cfg=3,
+        rescale_cfg=0.75,
         use_fp16=False,
         max_seg_sec=30.0,
+        seed=None,
+        num_overlaps=1,
     ):
         """
         SVC inference pipeline. First build vocal segments based on F0 contour, then run inference for each segment and merge results.
@@ -244,7 +258,16 @@ class SoulXSingerSVC(nn.Module):
                          Special: pitch_shift="auto" enables per-segment nearest-octave alignment.
             n_steps: number of diffusion steps for inference
             cfg: classifier-free guidance scale for inference
+            rescale_cfg: how much of the CFG extrapolation to std-normalise (1.0 = fully
+                  normalised/conservative, 0.0 = raw extrapolation). Upstream hard-codes 0.75.
+                  Dead when cfg == 0, which skips the CFG branch entirely.
             use_fp16: if True, run in FP16 except mel extraction to save memory and speed.
+            seed: base seed for the CFM initial noise. None = upstream behaviour (global RNG,
+                  non-reproducible). When set, segment i uses seed + i so segments stay
+                  independent while the whole run is reproducible.
+            num_overlaps: how many preceding active grids to prepend as context for each
+                  segment (see build_vocal_segments). Total window is still capped by
+                  max_seg_sec, so raising this only helps if segments are short.
         """
 
         # handle "auto" mode: per-segment octave alignment
@@ -296,6 +319,8 @@ class SoulXSingerSVC(nn.Module):
                     pitch_shift=seg_shift,
                     n_steps=n_steps,
                     cfg=cfg,
+                    rescale_cfg=rescale_cfg,
+                    seed=seed,
                 )
             return generated_audio, seg_shift
 
@@ -310,6 +335,7 @@ class SoulXSingerSVC(nn.Module):
             uv_frames_th=10,
             min_duration_sec=min(15.0, max_seg_sec / 2),
             max_duration_sec=max_seg_sec,
+            num_overlaps=num_overlaps,
         )
         if len(segments) == 0:
             segments = [(0.0, gt_wav.shape[-1] / self.audio_cfg.sample_rate)]
@@ -357,6 +383,8 @@ class SoulXSingerSVC(nn.Module):
                     pitch_shift=seg_shift,
                     n_steps=n_steps,
                     cfg=cfg,
+                    rescale_cfg=rescale_cfg,
+                    seed=None if seed is None else seed + idx,
                 )
 
             segment_start = int(round(seg_start_sec * self.audio_cfg.sample_rate))
@@ -374,7 +402,8 @@ class SoulXSingerSVC(nn.Module):
 
         return generated_audio, pitch_shift
 
-    def infer_segment(self, pt_mel, pt_wav, gt_wav, pt_f0, gt_f0, pitch_shift=0, n_steps=32, cfg=3):
+    def infer_segment(self, pt_mel, pt_wav, gt_wav, pt_f0, gt_f0, pitch_shift=0, n_steps=32, cfg=3,
+                      rescale_cfg=0.75, seed=None):
         len_prompt_mel = pt_mel.shape[1]
         pt_f0 = F.pad(pt_f0, (0, 0, 0, max(0, len_prompt_mel - pt_f0.shape[1])))[:, :len_prompt_mel]
 
@@ -401,7 +430,9 @@ class SoulXSingerSVC(nn.Module):
             pt_decoder_inp,
             gt_decoder_inp,
             n_timesteps=n_steps,
-            cfg=cfg
+            cfg=cfg,
+            rescale_cfg=rescale_cfg,
+            seed=seed,
         )
         
         generated_audio = self.vocoder(generated_mel.transpose(1, 2)[0:1, ...])

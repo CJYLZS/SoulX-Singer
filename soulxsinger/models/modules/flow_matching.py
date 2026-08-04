@@ -260,6 +260,7 @@ class FlowMatchingTransformer(nn.Module):
         n_timesteps=10,
         cfg=1.0,
         rescale_cfg=0.75,
+        seed=None,
     ):
         h = 1.0 / n_timesteps
         prompt_len = prompt.shape[1]
@@ -272,10 +273,17 @@ class FlowMatchingTransformer(nn.Module):
                 cond.device
             )  # (B, prompt_len)
         xt_mask = torch.cat([prompt_mask, x_mask], dim=1)
+        # 本地补丁：初始噪声可复现。上游每次调用都用全局 RNG，同一输入跑两遍
+        # 结果不同（音色相似度实测有波动），无法做 A/B 也无法多采样选优。
+        if seed is None:
+            generator = None
+        else:
+            generator = torch.Generator(device=cond.device).manual_seed(int(seed))
         z = torch.randn(
             (cond.shape[0], target_len, self.mel_dim),
             dtype=cond.dtype,
             device=cond.device,
+            generator=generator,
             requires_grad=False,
         )
         xt = z

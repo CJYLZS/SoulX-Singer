@@ -15,7 +15,8 @@ class CFMDecoder(nn.Module):
         noise, x, flow_pred, final_mask, prompt_len = outputs["output"]
         return noise, x, flow_pred, final_mask, prompt_len
 
-    def reverse_diffusion(self, pt_mel, pt_decoder_inp, gt_decoder_inp, n_timesteps=32, cfg=1):
+    def reverse_diffusion(self, pt_mel, pt_decoder_inp, gt_decoder_inp, n_timesteps=32, cfg=1,
+                          rescale_cfg=0.75, seed=None):
         diffusion_cond = torch.cat([pt_decoder_inp, gt_decoder_inp], dim=1)
         diffusion_cond_emb = self.model.cond_emb(diffusion_cond)
         diffusion_prompt = pt_mel
@@ -24,6 +25,8 @@ class CFMDecoder(nn.Module):
             diffusion_cond_emb,
             diffusion_prompt,
             n_timesteps=n_timesteps,
-            cfg=cfg
+            cfg=cfg,
+            rescale_cfg=rescale_cfg,
+            seed=seed,
         )
         return generated
