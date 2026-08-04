@@ -13,6 +13,16 @@ from soulxsinger.models.soulxsinger_svc import SoulXSingerSVC
 from soulxsinger.utils.audio_utils import load_wav
 
 
+def _pitch_shift_arg(v: str):
+    """--pitch_shift 接受整数半音数或字面量 "auto"（按段对齐到最近八度）。"""
+    if isinstance(v, str) and v.lower() == "auto":
+        return "auto"
+    try:
+        return int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'--pitch_shift 需要整数或 "auto"，收到 {v!r}')
+
+
 def build_model(
     model_path: str,
     config: DictConfig,
@@ -115,7 +125,10 @@ if __name__ == "__main__":
     parser.add_argument("--target_f0_path", type=str, default='example/audio/zh_target_f0.npy')
     parser.add_argument("--save_dir", type=str, default='outputs')
     parser.add_argument("--auto_shift", action="store_true")
-    parser.add_argument("--pitch_shift", type=int, default=0)
+    # 本地补丁：除整数外接受 "auto" —— 按段对齐到最近八度（见 soulxsinger_svc.py
+    # _nearest_octave_shift）。男女对唱/跨音区的歌里，全曲单一移调必然一头顾不上。
+    parser.add_argument("--pitch_shift", type=_pitch_shift_arg, default=0,
+                        help='移调半音数，或 "auto" 按段对齐到最近八度')
     parser.add_argument("--n_steps", type=int, default=32)
     parser.add_argument("--cfg", type=float, default=3.0)
     # 上游硬编码 30s/段（soulxsinger_svc.py:257），+num_overlaps 余量实测可达 33s，

@@ -34,6 +34,20 @@ class SoulXSingerSVC(nn.Module):
         self.vocoder = Vocoder()
 
     @staticmethod
+    def _nearest_octave_shift(seg_f0_median: float, ref_f0_median: float) -> int:
+        """
+        Compute the nearest octave shift (0, ±12, ±24, ±36) to align seg_f0_median with ref_f0_median.
+        Returns the shift in semitones.
+        """
+        if seg_f0_median <= 0 or ref_f0_median <= 0:
+            return 0
+        raw_shift = 12 * np.log2(ref_f0_median / seg_f0_median)
+        # round to nearest multiple of 12
+        octave_shift = int(round(raw_shift / 12.0)) * 12
+        # clamp to ±36 semitones (±3 octaves)
+        return max(-36, min(36, octave_shift))
+
+    @staticmethod
     def f0_to_coarse(f0, f0_bin=361, f0_min=32.7031956625, f0_shift=0):
         """
         Convert continuous F0 values to discrete F0 bins (SIL and C1 - B6, 361 bins).
@@ -226,14 +240,21 @@ class SoulXSingerSVC(nn.Module):
             pt_f0: prompt F0 path or tensor
             gt_f0: target F0 path or tensor
             auto_shift: whether to automatically calculate pitch shift based on median F0 of prompt and target
-            pitch_shift: manual pitch shift in semitones (overrides auto_shift if > 0)
+            pitch_shift: manual pitch shift in semitones (overrides auto_shift if > 0).
+                         Special: pitch_shift="auto" enables per-segment nearest-octave alignment.
             n_steps: number of diffusion steps for inference
             cfg: classifier-free guidance scale for inference
             use_fp16: if True, run in FP16 except mel extraction to save memory and speed.
         """
 
-        # calculate auto pitch shift
-        if auto_shift and pitch_shift == 0:
+        # handle "auto" mode: per-segment octave alignment
+        auto_octave = False
+        if isinstance(pitch_shift, str) and pitch_shift.lower() == "auto":
+            auto_octave = True
+            pitch_shift = 0  # will be overridden per segment
+        
+        # calculate auto pitch shift (legacy whole-song mode)
+        if auto_shift and pitch_shift == 0 and not auto_octave:
             if gt_f0 is not None and pt_f0 is not None:
                 gt_f0_median = torch.median(gt_f0[gt_f0 > 0])
                 pt_f0_median = torch.median(pt_f0[pt_f0 > 0])
@@ -254,8 +275,17 @@ class SoulXSingerSVC(nn.Module):
             pt_f0 = pt_f0.half()
             gt_f0 = gt_f0.half()
 
+        # pre-compute prompt median for auto-octave mode
+        pt_f0_median = None
+        if auto_octave:
+            pt_f0_median = torch.median(pt_f0[pt_f0 > 0]).item()
+
         # if target audio is less than 30 seconds, infer the whole audio
         if gt_wav.shape[-1] < max_seg_sec * self.audio_cfg.sample_rate:
+            seg_shift = pitch_shift
+            if auto_octave:
+                seg_f0_median = torch.median(gt_f0[gt_f0 > 0]).item()
+                seg_shift = self._nearest_octave_shift(seg_f0_median, pt_f0_median)
             with _autocast_if(use_fp16):
                 generated_audio = self.infer_segment(
                     pt_mel=pt_mel,
@@ -263,11 +293,11 @@ class SoulXSingerSVC(nn.Module):
                     gt_wav=gt_wav,
                     pt_f0=pt_f0,
                     gt_f0=gt_f0,
-                    pitch_shift=pitch_shift,
+                    pitch_shift=seg_shift,
                     n_steps=n_steps,
                     cfg=cfg,
                 )
-            return generated_audio, pitch_shift
+            return generated_audio, seg_shift
 
         # if target audio is longer than 30 seconds, build vocal segments and infer each segment
         generated_audio = []
@@ -286,6 +316,7 @@ class SoulXSingerSVC(nn.Module):
             overlap_segments = [(0.0, gt_wav.shape[-1] / self.audio_cfg.sample_rate)]
 
         generated_audio = torch.zeros_like(gt_wav)
+        applied_shifts = []
         for idx in tqdm(range(len(segments)), total=len(segments), desc="Inferring segments (SVC)", dynamic_ncols=True):
             overlap_start_sec, overlap_end_sec = overlap_segments[idx]
             seg_start_sec, seg_end_sec = segments[idx]
@@ -302,6 +333,20 @@ class SoulXSingerSVC(nn.Module):
 
             segment_gt_wav = gt_wav[:, wav_start:wav_end]
             segment_gt_f0 = gt_f0[:, f0_start:f0_end]
+
+            # per-segment nearest-octave alignment: decide the shift from the F0 of the
+            # part that actually lands in the output (segments[idx]), not the overlap
+            # context, otherwise a low-pitched lead-in would bias the whole segment.
+            seg_shift = pitch_shift
+            if auto_octave:
+                keep_f0 = gt_f0[:, int(round(seg_start_sec * f0_rate)): int(round(seg_end_sec * f0_rate))]
+                voiced = keep_f0[keep_f0 > 0]
+                if voiced.numel() > 0:
+                    seg_shift = self._nearest_octave_shift(torch.median(voiced).item(), pt_f0_median)
+                else:
+                    seg_shift = 0
+            applied_shifts.append((seg_start_sec, seg_end_sec, seg_shift))
+
             with _autocast_if(use_fp16):
                 segment_generated_audio = self.infer_segment(
                     pt_mel=pt_mel,
@@ -309,7 +354,7 @@ class SoulXSingerSVC(nn.Module):
                     gt_wav=segment_gt_wav,
                     pt_f0=pt_f0,
                     gt_f0=segment_gt_f0,
-                    pitch_shift=pitch_shift,
+                    pitch_shift=seg_shift,
                     n_steps=n_steps,
                     cfg=cfg,
                 )
@@ -319,7 +364,14 @@ class SoulXSingerSVC(nn.Module):
             segment_generated_audio = segment_generated_audio[segment_start - wav_start: segment_end - wav_start]
 
             generated_audio[:, segment_start:segment_end] = segment_generated_audio
-    
+
+        if auto_octave:
+            print(f"Auto-octave alignment (prompt median {pt_f0_median:.1f}Hz):")
+            for s, e, sh in applied_shifts:
+                print(f"  {s:7.1f}-{e:7.1f}s  shift {sh:+3d} st")
+            shifts_only = [sh for _, _, sh in applied_shifts]
+            pitch_shift = max(set(shifts_only), key=shifts_only.count) if shifts_only else 0
+
         return generated_audio, pitch_shift
 
     def infer_segment(self, pt_mel, pt_wav, gt_wav, pt_f0, gt_f0, pitch_shift=0, n_steps=32, cfg=3):
