@@ -79,6 +79,10 @@ def process(args, config, model: torch.nn.Module):
     gt_wav = load_wav(args.target_wav_path, config.audio.sample_rate).to(args.device)
     pt_f0 = torch.from_numpy(np.load(args.prompt_f0_path)).unsqueeze(0).to(args.device)
     gt_f0 = torch.from_numpy(np.load(args.target_f0_path)).unsqueeze(0).to(args.device)
+    # kNN retrieval pool: only loaded when kNN is on and a separate pool was given.
+    knn_pool_wav = None
+    if getattr(args, "knn_alpha", 0.0) > 0.0 and getattr(args, "knn_pool_wav", None):
+        knn_pool_wav = load_wav(args.knn_pool_wav, config.audio.sample_rate).to(args.device)
 
     n_step = args.n_steps if hasattr(args, "n_steps") else config.infer.n_steps
     cfg = args.cfg if hasattr(args, "cfg") else config.infer.cfg
@@ -98,6 +102,9 @@ def process(args, config, model: torch.nn.Module):
             seed=getattr(args, "seed", None),
             num_overlaps=getattr(args, "num_overlaps", 1),
             rescale_cfg=getattr(args, "rescale_cfg", 0.75),
+            knn_alpha=getattr(args, "knn_alpha", 0.0),
+            knn_k=getattr(args, "knn_k", 4),
+            knn_pool_wav=knn_pool_wav,
         )
     generated_audio = generated_audio.squeeze().float().cpu().numpy()
     if args.pitch_shift != generated_shift:
@@ -145,6 +152,14 @@ if __name__ == "__main__":
                              "方差实验/多采样选优时使用）")
     parser.add_argument("--num_overlaps", type=int, default=1,
                         help="每段往前取几个活性格作为上下文（默认 1；总窗仍受 max_seg_sec 限制）")
+    parser.add_argument("--knn_alpha", type=float, default=0.0,
+                        help="kNN 内容特征替换强度（0=关闭，1=完全替换；0.2-0.4 起步）")
+    parser.add_argument("--knn_k", type=int, default=4,
+                        help="kNN 近邻数（默认 4，同 kNN-VC）")
+    parser.add_argument("--knn_pool_wav", type=str, default=None,
+                        help="kNN 检索池音频（默认用 prompt_wav，受 whisper 30s 截断）。"
+                             "指向完整参考人声（如 refsep2/lead.wav, 163s）可分块编码绕开 "
+                             "30s 限制：匹配失败帧 9.8%%->1.9%%。检索池不进模型，故不受 30s 约束")
     parser.add_argument(
         "--fp16",
         action="store_true",

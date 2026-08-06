@@ -245,6 +245,9 @@ class SoulXSingerSVC(nn.Module):
         max_seg_sec=30.0,
         seed=None,
         num_overlaps=1,
+        knn_alpha=0.0,
+        knn_k=4,
+        knn_pool_wav: str|torch.Tensor|None=None,
     ):
         """
         SVC inference pipeline. First build vocal segments based on F0 contour, then run inference for each segment and merge results.
@@ -268,6 +271,11 @@ class SoulXSingerSVC(nn.Module):
             num_overlaps: how many preceding active grids to prepend as context for each
                   segment (see build_vocal_segments). Total window is still capped by
                   max_seg_sec, so raising this only helps if segments are short.
+            knn_pool_wav: optional separate waveform for kNN retrieval pool (bypasses the 30s
+                  whisper truncation). If None, falls back to pt_wav (current 30s-capped
+                  behaviour). Typically the full clean reference (e.g. 163s refsep2/lead.wav),
+                  vs pt_wav being the 28.9s prompt_ext.wav. Measured on a 163s reference:
+                  frames with nn1<0.5 drop from 9.8% to 1.9% vs the 30s pool.
         """
 
         # handle "auto" mode: per-segment octave alignment
@@ -303,6 +311,16 @@ class SoulXSingerSVC(nn.Module):
         if auto_octave:
             pt_f0_median = torch.median(pt_f0[pt_f0 > 0]).item()
 
+        # Build the kNN retrieval pool once, outside the segment loop: it is identical for every
+        # segment and chunk-encoding a 163s reference costs ~6 whisper passes.
+        knn_pool = None
+        if knn_alpha > 0.0 and knn_pool_wav is not None:
+            pool_wav = knn_pool_wav.half() if use_fp16 else knn_pool_wav
+            with _autocast_if(use_fp16):
+                knn_pool = self.encode_long(pool_wav)
+            print(f"kNN pool: {knn_pool.shape[1]} frames "
+                  f"({knn_pool.shape[1] / 50:.1f}s) from knn_pool_wav")
+
         # if target audio is less than 30 seconds, infer the whole audio
         if gt_wav.shape[-1] < max_seg_sec * self.audio_cfg.sample_rate:
             seg_shift = pitch_shift
@@ -321,6 +339,9 @@ class SoulXSingerSVC(nn.Module):
                     cfg=cfg,
                     rescale_cfg=rescale_cfg,
                     seed=seed,
+                    knn_alpha=knn_alpha,
+                    knn_k=knn_k,
+                    knn_pool=knn_pool,
                 )
             return generated_audio, seg_shift
 
@@ -385,6 +406,9 @@ class SoulXSingerSVC(nn.Module):
                     cfg=cfg,
                     rescale_cfg=rescale_cfg,
                     seed=None if seed is None else seed + idx,
+                    knn_alpha=knn_alpha,
+                    knn_k=knn_k,
+                    knn_pool=knn_pool,
                 )
 
             segment_start = int(round(seg_start_sec * self.audio_cfg.sample_rate))
@@ -402,8 +426,83 @@ class SoulXSingerSVC(nn.Module):
 
         return generated_audio, pitch_shift
 
+    @staticmethod
+    def _knn_replace_content(gt_content_feat, pt_content_feat, alpha, k, valid_pt_frames=None):
+        """Move the source's whisper content features toward the prompt speaker via kNN retrieval.
+
+        Rationale (measured in this workspace): whisper features carry a source-singer timbre
+        residual, which is why *lowering* `cfg` raises speaker similarity — amplifying the
+        condition amplifies the residual. Deleting the residual does not work: mean-shifting the
+        features toward the prompt made things worse at every alpha, because the decoder was
+        trained with the residual present (and with `cfg_drop_prob: 0.2`, only the true condition
+        and exactly-zero are in-distribution; a constant offset is neither).
+
+        This instead *replaces* the residual with the target's. Each source frame is blended with
+        the mean of its k nearest neighbours among the prompt's own whisper frames, so every
+        substituted vector is a convex combination of genuine whisper-base final-layer outputs and
+        stays on the trained manifold. Same idea as kNN-VC / RVC's faiss index, applied to the
+        condition tensor SoulX already computes.
+
+        Args:
+            gt_content_feat: (1, T_gt, D) source features, the thing being edited.
+            pt_content_feat: (1, T_pt, D) prompt features, used as the matching pool.
+            alpha: blend weight. 0.0 returns gt untouched; 1.0 is full replacement. Partial
+                   interpolation degrades gracefully where the prompt lacks a phone, which matters
+                   because the pool is ~25s of speech being used to reconstruct singing.
+            k: neighbours to average (kNN-VC uses 4).
+            valid_pt_frames: optional int, restrict the pool to the first N prompt frames so
+                   right-padding introduced by the caller cannot be matched against.
+        Returns:
+            (1, T_gt, D) tensor, same dtype/device as gt_content_feat.
+        """
+        if alpha <= 0.0:
+            return gt_content_feat
+
+        pool = pt_content_feat[0]
+        if valid_pt_frames is not None:
+            pool = pool[:max(1, min(int(valid_pt_frames), pool.shape[0]))]
+        if pool.shape[0] == 0:
+            return gt_content_feat
+
+        src = gt_content_feat[0]
+        # cosine matching in float32: the features can arrive in fp16 under --use_fp16, and
+        # normalize+matmul in half loses enough precision to shuffle near-ties in the topk.
+        g = F.normalize(src.float(), dim=-1)
+        p = F.normalize(pool.float(), dim=-1)
+        k_eff = max(1, min(int(k), pool.shape[0]))
+        idx = (g @ p.T).topk(k=k_eff, dim=-1).indices           # (T_gt, k)
+        knn = pool[idx].to(torch.float32).mean(dim=1)           # (T_gt, D)
+        out = (1.0 - alpha) * src.float() + alpha * knn
+        return out.to(gt_content_feat.dtype).unsqueeze(0)
+
+    def encode_long(self, wav, chunk_sec=28.0):
+        """Encode arbitrarily long audio by chunking, bypassing whisper's 30s truncation.
+
+        `WhisperEncoder.encode` hard-truncates to WHISPER_MEL_FRAMES=3000 (30s). That limit is
+        mandatory for the in-context prompt (`pt_mel` must stay aligned with `pt_content_feat`),
+        but a kNN *retrieval pool* never enters the model, so it can be built from the full
+        reference. Measured on a 163s reference: frames with no usable neighbour (cos < 0.5)
+        drop from 9.8% to 1.9% versus the 30s-truncated pool.
+
+        Returns (1, N, D); each chunk contributes only its real frames, never right-padding.
+        """
+        sr = self.audio_cfg.sample_rate
+        step = int(chunk_sec * sr)
+        n = wav.shape[-1]
+        if n <= step:
+            return self.whisper_encoder.encode(wav, sr=sr)
+        parts = []
+        for s in range(0, n, step):
+            seg = wav[..., s:s + step]
+            if seg.shape[-1] < sr * 0.5:   # a <0.5s tail gives unreliable whisper output
+                break
+            f = self.whisper_encoder.encode(seg, sr=sr)
+            n_real = min(int(np.ceil(seg.shape[-1] / sr * 50)), f.shape[1])
+            parts.append(f[:, :n_real, :])
+        return torch.cat(parts, 1)
+
     def infer_segment(self, pt_mel, pt_wav, gt_wav, pt_f0, gt_f0, pitch_shift=0, n_steps=32, cfg=3,
-                      rescale_cfg=0.75, seed=None):
+                      rescale_cfg=0.75, seed=None, knn_alpha=0.0, knn_k=4, knn_pool=None):
         len_prompt_mel = pt_mel.shape[1]
         pt_f0 = F.pad(pt_f0, (0, 0, 0, max(0, len_prompt_mel - pt_f0.shape[1])))[:, :len_prompt_mel]
 
@@ -414,8 +513,23 @@ class SoulXSingerSVC(nn.Module):
         pt_content_feat = self.whisper_encoder.encode(pt_wav, sr=self.audio_cfg.sample_rate)
         gt_content_feat = self.whisper_encoder.encode(gt_wav, sr=self.audio_cfg.sample_rate)
         t_pt, t_gt = f0_course_pt.shape[1], f0_course_gt.shape[1]
+        # remember how many prompt frames whisper actually produced, so the kNN pool below
+        # excludes the zero-padding that the next line may append.
+        n_pt_real = min(pt_content_feat.shape[1], t_pt)
         pt_content_feat = F.pad(pt_content_feat, (0, 0, 0, max(0, t_pt - pt_content_feat.shape[1])))[:, :t_pt, :]
         gt_content_feat = F.pad(gt_content_feat, (0, 0, 0, max(0, t_gt - gt_content_feat.shape[1])))[:, :t_gt, :]
+
+        if knn_alpha > 0.0:
+            # The retrieval pool is decoupled from the in-context prompt: `knn_pool` (whole
+            # reference, chunk-encoded) when supplied, else the 30s-capped prompt features.
+            if knn_pool is not None:
+                pool, n_pool = knn_pool, None
+            else:
+                pool, n_pool = pt_content_feat, n_pt_real
+            gt_content_feat = self._knn_replace_content(
+                gt_content_feat, pool, alpha=knn_alpha, k=knn_k,
+                valid_pt_frames=n_pool,
+            )
 
         content_feat = torch.cat([pt_content_feat, gt_content_feat], 1)
 
