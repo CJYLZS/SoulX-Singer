@@ -111,6 +111,11 @@ def process(args, config, model: torch.nn.Module):
                 cfg=config.infer.cfg,
                 control=args.control,
                 use_fp16=args.use_fp16,
+                # 本地补丁: 上游从不播种，CFM 初始噪声走全局 RNG，每次结果都不同
+                # (实测同配置 4 次 md5 全不同, SIM std 0.0065)。segment i 用 seed+i，
+                # 与 inference_svc.py 的约定一致。None = 保持上游随机行为。
+                seed=(None if getattr(args, "seed", None) is None else args.seed + idx),
+                rescale_cfg=getattr(args, "rescale_cfg", 0.75),
             )
 
         generated_audio = generated_audio.squeeze().cpu().numpy()
@@ -155,6 +160,16 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Use FP16 inference (faster on GPU)",
+    )
+    # --- 本地补丁 ---
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="CFM 初始噪声种子（segment i 用 seed+i）。不给则保持上游的随机行为。"
+             "任何 A/B 都必须固定它: 未播种时同配置的 SIM std 实测 0.0065。",
+    )
+    parser.add_argument(
+        "--rescale_cfg", type=float, default=0.75,
+        help="CFG std 重归一化混合比（上游硬编码 0.75）",
     )
     args = parser.parse_args()
     args.use_fp16 = args.fp16

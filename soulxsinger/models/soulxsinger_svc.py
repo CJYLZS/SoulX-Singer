@@ -510,7 +510,13 @@ class SoulXSingerSVC(nn.Module):
         f0_course_gt = self.f0_to_coarse(gt_f0, f0_shift=pitch_shift * 5)
         f0_course = torch.cat([f0_course_pt, f0_course_gt], 1)
 
-        pt_content_feat = self.whisper_encoder.encode(pt_wav, sr=self.audio_cfg.sample_rate)
+        # For prompts >30s, encode_long chunks at 28s and concatenates real frames only,
+        # avoiding the zero-padding that whisper_encoder.encode() would apply to the excess.
+        # For ≤30s prompts the two paths are equivalent.
+        if pt_wav.shape[-1] / self.audio_cfg.sample_rate > 30.0:
+            pt_content_feat = self.encode_long(pt_wav)
+        else:
+            pt_content_feat = self.whisper_encoder.encode(pt_wav, sr=self.audio_cfg.sample_rate)
         gt_content_feat = self.whisper_encoder.encode(gt_wav, sr=self.audio_cfg.sample_rate)
         t_pt, t_gt = f0_course_pt.shape[1], f0_course_gt.shape[1]
         # remember how many prompt frames whisper actually produced, so the kNN pool below

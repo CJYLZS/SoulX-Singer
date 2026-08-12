@@ -107,7 +107,7 @@ class SoulXSinger(nn.Module):
         
         return f0_coarse
 
-    def infer(self, meta: dict, auto_shift=False, pitch_shift=0, n_steps=32, cfg=3, control="melody", use_fp16=False):
+    def infer(self, meta: dict, auto_shift=False, pitch_shift=0, n_steps=32, cfg=3, control="melody", use_fp16=False, seed=None, rescale_cfg=0.75):
         
         gt_note_text = meta['target']['phoneme']
         gt_mel2note = meta['target']['mel2note']
@@ -190,7 +190,9 @@ class SoulXSinger(nn.Module):
                 pt_decoder_inp,
                 gt_decoder_inp,
                 n_timesteps=n_steps,
-                cfg=cfg
+                cfg=cfg,
+                rescale_cfg=rescale_cfg,
+                seed=seed,
             )
             generated_audio = self.vocoder(generated_mel.transpose(1, 2)[0:1, ...]).float()
 
